@@ -40,14 +40,14 @@ def morning_scan():
     logger.info("=== MORNING SCAN ===")
     try:
         run_agent(
-            "Morning scan. Start with macro context — check the macro environment "
-            "to understand today's regime. Then review our portfolio for any "
-            "positions affected by overnight news or filings. Check the earnings "
-            "calendar for any companies reporting today or this week. For any "
-            "companies on our watchlist (AAPL, MSFT, NVDA, GOOGL, AMZN, META), "
-            "pull earnings analysis and recent SEC filings. Only consider new "
-            "positions if you find a fundamental catalyst the market hasn't "
-            "fully priced — confirm with technicals before entering."
+            "Morning scan. You are in EVALUATION MODE — you need to build a track "
+            "record. Start with macro context. Then check our portfolio — if we have "
+            "fewer than 3 positions, you MUST find new opportunities today. Check the "
+            "earnings calendar for catalysts this week. Analyze AAPL, MSFT, NVDA, "
+            "GOOGL, AMZN, and META — pull earnings analysis, SEC filings, and "
+            "transcripts where available. For each, pull technicals to identify "
+            "entry levels. Take positions in your top 2-3 ideas at appropriate "
+            "conviction sizing. Use bracket orders with defined stops and targets."
         )
     except Exception as exc:
         logger.error("Morning scan failed: %s", exc, exc_info=True)
@@ -61,14 +61,13 @@ def midday_review():
     logger.info("=== MIDDAY REVIEW ===")
     try:
         run_agent(
-            "Midday portfolio review. For each open position: (1) Check for any new "
-            "8-K filings or material events since our last review, (2) Pull fresh "
-            "earnings data to verify the fundamental thesis still holds, (3) Check "
-            "technicals for any breakdown of key support/resistance levels. Also "
-            "scan recent news for any macro developments (Fed commentary, economic "
-            "data releases, geopolitical events) that change the portfolio's risk "
-            "profile. Close any position where the original fundamental thesis "
-            "has been invalidated by new information."
+            "Midday review. Check portfolio — for each open position, pull fresh "
+            "earnings data and technicals. Has the thesis changed? Has the stop "
+            "been breached? Close anything that's broken. If we have fewer than 3 "
+            "positions, scan for new opportunities — check any names that have "
+            "moved significantly today and pull their fundamentals. Look for stocks "
+            "that pulled back into support with strong earnings trends. If you find "
+            "a medium-conviction setup, take it at appropriate size."
         )
     except Exception as exc:
         logger.error("Midday review failed: %s", exc, exc_info=True)
@@ -82,11 +81,13 @@ def afternoon_management():
     logger.info("=== AFTERNOON MANAGEMENT ===")
     try:
         run_agent(
-            "Pre-close management. Review all open positions. For any position "
-            "that is marginally profitable but showing weakening momentum, "
-            "consider closing to lock in gains. For any intraday entries, "
-            "decide whether to hold overnight or close. Do not open new "
-            "positions this close to market close."
+            "Pre-close management. Review all open positions — check if any hit "
+            "their take-profit or stop-loss targets during the day. For intraday "
+            "entries, decide whether the overnight thesis is strong enough to hold. "
+            "Close positions where the thesis has weakened. If we have significant "
+            "cash (over 60% of NLV), note this as a problem to address at tomorrow's "
+            "morning scan — we should be more deployed. Summarize today's P&L and "
+            "any trades executed."
         )
     except Exception as exc:
         logger.error("Afternoon management failed: %s", exc, exc_info=True)
