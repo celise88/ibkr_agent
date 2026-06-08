@@ -22,6 +22,7 @@ from ibkr_agent.tools.execution import place_trade, place_bracket_trade, close_p
 from ibkr_agent.tools.news import get_news_sentiment
 from ibkr_agent.tools.sec_filings import get_sec_filings, search_sec_disclosures
 from ibkr_agent.tools.earnings import get_earnings_analysis, get_earnings_calendar
+from ibkr_agent.tools.leveraged_etf_flow import get_etf_flow_analysis
 from ibkr_agent.tools.macro import get_macro_environment
 from ibkr_agent.tools.transcripts import get_earnings_transcript, list_available_transcripts
 
@@ -37,6 +38,7 @@ ALL_TOOLS = [
     get_earnings_calendar,
     get_macro_environment,
     get_news_sentiment,
+    get_etf_flow_analysis,
     # Market data (pre-computed, LLM interprets)
     get_portfolio_snapshot,
     get_technical_summary,
@@ -60,5 +62,6 @@ __all__ = [
     "get_macro_environment",
     "get_earnings_transcript",
     "list_available_transcripts",
+    "get_etf_flow_analysis",
     "ALL_TOOLS",
 ]

@@ -24,6 +24,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from ibkr_agent.agent import run_agent, run_review
 from ibkr_agent.audit import log_agent, setup_logging
 from ibkr_agent.connection import disconnect
+from ibkr_agent.tools.leveraged_etf_flow import get_etf_flow_analysis
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,50 @@ def morning_scan():
         logger.error("Morning scan failed: %s", exc, exc_info=True)
 
 
+def etf_flow_scan():
+    """
+    9:40 AM ET — runs 10 minutes after market open.
+
+    Computes leveraged ETF rebalancing flow estimates and feeds them as
+    structured context into the analyst agent's morning directive.
+    Gives the analyst early warning of which underlyings will face
+    mechanical buy/sell pressure near the close.
+
+    Falls back to standard morning_scan() if the flow calculation fails,
+    so the day is never lost to an error in this module.
+    """
+    logger.info("=== ETF REBALANCING FLOW SCAN ===")
+    try:
+        flow_briefing = get_etf_flow_analysis.invoke({})
+
+        directive = (
+            "LEVERAGED ETF FLOW PRE-ANALYSIS (computed before your research):\n\n"
+            f"{flow_briefing}\n\n"
+            "---\n"
+            "Use the above flow data to inform your intraday timing recommendations:\n"
+            "  • For any underlying with STRONG/MODERATE SELL flow: do NOT recommend "
+            "    entering long positions in the final 30-60 minutes of today's session. "
+            "    Flag this in your recommendation's entry timing guidance.\n"
+            "  • For any underlying with STRONG/MODERATE BUY flow: note that late-day "
+            "    strength may be mechanical, not fundamental. Front-running has likely "
+            "    already occurred by institutional desks.\n"
+            "  • For ETFs with high decay warnings: if recommending these instruments, "
+            "    specify DAY-TRADE ONLY in your conviction notes.\n\n"
+            "Now proceed with your standard morning scan. Analyze AAPL, MSFT, NVDA, "
+            "GOOGL, AMZN, META — plus any underlyings flagged above with strong flows. "
+            "Pull earnings analysis, SEC filings, and technicals for each. "
+            "Produce specific trade recommendations with entry, stop, and target levels. "
+            "Incorporate the flow data into your timing guidance."
+        )
+
+        run_agent(directive)
+
+    except Exception as exc:
+        logger.error("ETF flow scan failed: %s", exc, exc_info=True)
+        logger.warning("Falling back to standard morning scan without flow data.")
+        morning_scan()
+
+
 def midday_review():
     """
     Midday portfolio health check.
@@ -69,6 +114,48 @@ def midday_review():
         )
     except Exception as exc:
         logger.error("Midday review failed: %s", exc, exc_info=True)
+
+
+def etf_flow_close_warning():
+    """
+    3:00 PM ET — 60 minutes before close.
+
+    Re-runs flow estimates with updated intraday prices. By 3 PM the day's
+    direction is largely locked in, so estimates are accurate. Feeds the
+    briefing into the afternoon management review so the trader knows which
+    underlyings to avoid or target into the close.
+
+    Falls back to standard afternoon_management() if the flow calculation fails.
+    """
+    logger.info("=== ETF FLOW CLOSE WARNING ===")
+    try:
+        flow_briefing = get_etf_flow_analysis.invoke({})
+
+        log_agent("etf_flow_close_warning", {"briefing_length": len(flow_briefing)})
+
+        directive = (
+            "PRE-CLOSE ETF REBALANCING FLOW UPDATE:\n\n"
+            f"{flow_briefing}\n\n"
+            "---\n"
+            "It is now approximately 3:00 PM ET — 60 minutes before close. "
+            "Review all current positions in light of the above flow data:\n\n"
+            "  1. For any position in an underlying with STRONG/MODERATE SELL flow: "
+            "     consider closing or trimming NOW rather than into the mechanical "
+            "     selling pressure at close. You can re-enter post-close at a better price.\n"
+            "  2. For any underlying with STRONG/MODERATE BUY flow where you have NO position: "
+            "     this window (3:00-3:15 PM) is where institutional front-runners are "
+            "     already positioned — momentum may continue to ~3:45 PM then reverse.\n"
+            "  3. For all positions: document your hold-overnight thesis via decline_trade "
+            "     or close/trim as appropriate.\n\n"
+            "Pull fresh technicals for each open position before deciding."
+        )
+
+        run_review(directive)
+
+    except Exception as exc:
+        logger.error("ETF flow close warning failed: %s", exc, exc_info=True)
+        logger.warning("Falling back to standard afternoon management.")
+        afternoon_management()
 
 
 def afternoon_management():
@@ -148,6 +235,30 @@ def create_scheduler() -> BlockingScheduler:
         day_of_week="mon-fri",
         hour=15,
         minute=45,
+        misfire_grace_time=300,
+    )
+
+    # 9:40 AM ET — ETF flow scan (10 min after open, replaces bare morning_scan
+    # on days when this runs — morning_scan remains as fallback within etf_flow_scan)
+    scheduler.add_job(
+        etf_flow_scan,
+        "cron",
+        id="etf_flow_scan",
+        day_of_week="mon-fri",
+        hour=9,
+        minute=40,
+        misfire_grace_time=300,
+    )
+
+    # 3:00 PM ET — pre-close flow warning (runs 45 min before the existing
+    # afternoon_management job at 3:45 PM; both jobs run on the same days)
+    scheduler.add_job(
+        etf_flow_close_warning,
+        "cron",
+        id="etf_flow_close_warning",
+        day_of_week="mon-fri",
+        hour=15,
+        minute=0,
         misfire_grace_time=300,
     )
 
