@@ -119,7 +119,7 @@ def _fetch_edgar_transcript(ticker: str) -> dict[str, Any] | None:
     url = f"{_EDGAR_BASE}/submissions/CIK{cik}.json"
     try:
         req = Request(url, headers=_EDGAR_HEADERS)
-        with urlopen(req, timeout=15) as resp:
+        with urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (URLError, json.JSONDecodeError) as exc:
         logger.debug("EDGAR submissions failed for %s: %s", ticker, exc)
@@ -179,7 +179,7 @@ def _fetch_edgar_transcript(ticker: str) -> dict[str, Any] | None:
             exhibit_url = f"{index_url}{item['name']}"
             try:
                 req = Request(exhibit_url, headers=_EDGAR_HEADERS)
-                with urlopen(req, timeout=15) as resp:
+                with urlopen(req, timeout=10) as resp:
                     content = resp.read().decode("utf-8", errors="replace")
             except (URLError, UnicodeDecodeError):
                 continue
@@ -242,7 +242,7 @@ def _fetch_api_ninjas_transcript(
             "X-Api-Key": API_NINJAS_KEY,
             "User-Agent": "IBKRAgent/0.1",
         })
-        with urlopen(req, timeout=15) as resp:
+        with urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (URLError, json.JSONDecodeError) as exc:
         logger.debug("API Ninjas transcript failed for %s: %s", ticker, exc)

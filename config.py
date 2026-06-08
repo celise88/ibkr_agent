@@ -41,7 +41,7 @@ class IBKRConnectionConfig:
     host: str = "127.0.0.1"
     port: int = 4002                # IB Gateway paper default; TWS paper = 7497
     client_id: int = 1
-    timeout: float = 15.0
+    timeout: float = 45.0
     readonly: bool = False
     market_data_type: int = 3       # 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
 
@@ -116,3 +116,7 @@ LOG = LogConfig()
 
 # Anthropic API key — validated at import so failures are loud and early
 ANTHROPIC_API_KEY = _require_env("ANTHROPIC_API_KEY")
+
+# Optional GROQ fallback. If set, Anthropic 400 errors may be retried via GROQ.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "groq-2.1-mini")

@@ -100,8 +100,8 @@ def managed_connection() -> Generator[IB, None, None]:
 def ensure_connected(func):
     """
     Decorator that guarantees a live connection before calling the wrapped
-    function. Retries once on ConnectionError (handles TWS restarts / brief
-    network blips).
+    function. Retries on ConnectionError, TimeoutError, and asyncio cancellation
+    that can occur when ib_insync's internal connect call is interrupted.
     """
     def wrapper(*args, **kwargs):
         max_retries = 2
@@ -109,7 +109,7 @@ def ensure_connected(func):
             try:
                 get_connection()
                 return func(*args, **kwargs)
-            except (ConnectionError, OSError, TimeoutError) as exc:
+            except (ConnectionError, OSError, TimeoutError, asyncio.CancelledError) as exc:
                 if attempt < max_retries - 1:
                     logger.warning(
                         "Connection lost (%s), reconnecting (attempt %d/%d)...",

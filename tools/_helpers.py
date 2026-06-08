@@ -99,7 +99,7 @@ def get_gross_exposure() -> float:
     for pos in ib.positions():
         contract = pos.contract
         ib.qualifyContracts(contract)
-        price = get_market_price(contract, timeout_sec=1.0)
+        price = get_market_price(contract, timeout_sec=45)
         if price is not None:
             total += abs(price * float(pos.position))
     return total
@@ -115,7 +115,7 @@ def get_position_for_symbol(symbol: str) -> dict[str, Any] | None:
         if pos.contract.symbol == symbol:
             contract = pos.contract
             ib.qualifyContracts(contract)
-            price = get_market_price(contract, timeout_sec=1.0)
+            price = get_market_price(contract, timeout_sec=45)
             qty = float(pos.position)
             avg_cost = float(pos.avgCost)
             market_value = price * qty if price else None

@@ -120,7 +120,7 @@ def _alphavantage_get(function: str, params: dict[str, str]) -> dict | None:
     url = f"https://www.alphavantage.co/query?{query}"
     try:
         req = Request(url, headers={"User-Agent": "IBKRAgent/0.1"})
-        with urlopen(req, timeout=15) as resp:
+        with urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except (URLError, json.JSONDecodeError) as exc:
         logger.debug("Alpha Vantage %s failed: %s", function, exc)

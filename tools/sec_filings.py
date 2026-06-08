@@ -87,7 +87,7 @@ def _fetch_recent_filings(
     url = f"{_EDGAR_BASE}/submissions/CIK{cik}.json"
     try:
         req = Request(url, headers=_EDGAR_HEADERS)
-        with urlopen(req, timeout=15) as resp:
+        with urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (URLError, json.JSONDecodeError) as exc:
         logger.warning("EDGAR submissions request failed for CIK %s: %s", cik, exc)
@@ -156,7 +156,7 @@ def _fetch_financial_facts(cik: str, metrics: list[str] | None = None) -> dict[s
     url = f"{_EDGAR_BASE}/api/xbrl/companyfacts/CIK{cik}.json"
     try:
         req = Request(url, headers=_EDGAR_HEADERS)
-        with urlopen(req, timeout=15) as resp:
+        with urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (URLError, json.JSONDecodeError) as exc:
         logger.debug("XBRL companyfacts failed for CIK %s: %s", cik, exc)
@@ -240,7 +240,7 @@ def _search_filings_fulltext(
 
     try:
         req = Request(url, headers=_EDGAR_HEADERS)
-        with urlopen(req, timeout=15) as resp:
+        with urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (URLError, json.JSONDecodeError) as exc:
         logger.debug("EFTS search failed for '%s': %s", query, exc)

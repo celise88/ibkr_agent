@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-from ibkr_agent.agent import run_agent
+from ibkr_agent.agent import run_agent, run_review
 from ibkr_agent.audit import log_agent, setup_logging
 from ibkr_agent.connection import disconnect
 
@@ -60,14 +60,12 @@ def midday_review():
     """
     logger.info("=== MIDDAY REVIEW ===")
     try:
-        run_agent(
-            "Midday review. Check portfolio — for each open position, pull fresh "
-            "earnings data and technicals. Has the thesis changed? Has the stop "
-            "been breached? Close anything that's broken. If we have fewer than 3 "
-            "positions, scan for new opportunities — check any names that have "
-            "moved significantly today and pull their fundamentals. Look for stocks "
-            "that pulled back into support with strong earnings trends. If you find "
-            "a medium-conviction setup, take it at appropriate size."
+        run_review(
+            "Midday portfolio review. Check all positions — pull fresh technicals "
+            "for each. For any position where the stop-loss has been breached or "
+            "the thesis has broken, close it. For positions you're holding, call "
+            "decline_trade to document why. If we have fewer than 3 positions, "
+            "flag that the morning scan needs to be more aggressive tomorrow."
         )
     except Exception as exc:
         logger.error("Midday review failed: %s", exc, exc_info=True)
@@ -80,14 +78,13 @@ def afternoon_management():
     """
     logger.info("=== AFTERNOON MANAGEMENT ===")
     try:
-        run_agent(
-            "Pre-close management. Review all open positions — check if any hit "
-            "their take-profit or stop-loss targets during the day. For intraday "
-            "entries, decide whether the overnight thesis is strong enough to hold. "
-            "Close positions where the thesis has weakened. If we have significant "
-            "cash (over 60% of NLV), note this as a problem to address at tomorrow's "
-            "morning scan — we should be more deployed. Summarize today's P&L and "
-            "any trades executed."
+        run_review(
+            "Pre-close portfolio review. For each open position, check if the "
+            "take-profit or stop-loss has been hit. For intraday entries, decide "
+            "whether to hold overnight — call decline_trade to document your hold "
+            "thesis for each position you keep. Close anything that's weakened. "
+            "Summarize: positions held, today's P&L, and gross exposure percentage. "
+            "If exposure is below 30%, note that we need more positions tomorrow."
         )
     except Exception as exc:
         logger.error("Afternoon management failed: %s", exc, exc_info=True)

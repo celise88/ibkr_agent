@@ -68,7 +68,7 @@ def get_portfolio_snapshot() -> dict:
 
         qty = float(pos.position)
         avg_cost = float(pos.avgCost)
-        price = get_market_price(contract, timeout_sec=1.5)
+        price = get_market_price(contract, timeout_sec=45)
 
         if price is not None:
             market_value = price * qty

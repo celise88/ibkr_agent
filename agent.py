@@ -1,28 +1,99 @@
 """
-LangGraph agent: the reasoning loop that connects the LLM to IBKR tools.
+Two-phase trading agent: Analyst → Trader.
 
-The graph is simple: agent → [tools → agent]* → END
-Tool calls loop back to the agent for continued reasoning until the LLM
-decides it's done (no more tool_calls in the response).
+Phase 1 (Analyst): Researches using all information tools. Produces a
+structured analysis with trade recommendations. This phase works well
+already — the agent does thorough research.
+
+Phase 2 (Trader): Receives the analyst's output and MUST act on it.
+The trader has access ONLY to execution tools plus a `decline_trade`
+tool. The forcing function: ending a turn without calling ANY tool is
+not possible — the trader must either execute or explicitly decline
+with structured justification.
+
+This architecture solves the "analysis paralysis" problem where the
+agent researches thoroughly but never pulls the trigger.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
+import os
 import time
 from typing import Annotated, Any
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage, AIMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
+from langgraph_sdk.errors import BadRequestError
 
-from ibkr_agent.audit import log_agent
-from ibkr_agent.config import LLM, RISK
+from ibkr_agent.audit import log_agent, log_trade
+from ibkr_agent.config import GROQ_API_KEY, GROQ_MODEL, LLM, RISK
 from ibkr_agent.tools import ALL_TOOLS
+from ibkr_agent.tools.portfolio import get_portfolio_snapshot
+from ibkr_agent.tools.technicals import get_technical_summary
+from ibkr_agent.tools.execution import place_trade, place_bracket_trade, close_position
 
 logger = logging.getLogger(__name__)
+
+
+def _load_groq_llm() -> Any | None:
+    if not GROQ_API_KEY:
+        return None
+
+    for module_name in ("langchain_groq", "langchain_groq.chat_models"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+
+        ChatGroq = getattr(module, "ChatGroq", None)
+        if ChatGroq is None:
+            continue
+
+        try:
+            return ChatGroq(
+                model=GROQ_MODEL,
+                api_key=GROQ_API_KEY,
+                temperature=LLM.temperature,
+                max_tokens=LLM.max_tokens,
+            )
+        except TypeError:
+            return ChatGroq(
+                model=GROQ_MODEL,
+                api_key=GROQ_API_KEY,
+                temperature=LLM.temperature,
+            )
+
+    return None
+
+
+def _invoke_with_groq_fallback(llm: Any, messages: list[BaseMessage], phase_name: str) -> Any:
+    try:
+        return llm.invoke(messages)
+    except BadRequestError as exc:
+        if exc.status_code != 400:
+            raise
+        groq_llm = _load_groq_llm()
+        if groq_llm is None:
+            logger.error(
+                "Anthropic returned HTTP 400 but GROQ fallback is unavailable. "
+                "Set GROQ_API_KEY and install langchain_groq."
+            )
+            raise
+        logger.warning("Anthropic returned HTTP 400; falling back to GROQ for %s", phase_name)
+        return groq_llm.invoke(messages)
+    except Exception as exc:
+        status_code = getattr(exc, "status_code", None)
+        if status_code == 400:
+            groq_llm = _load_groq_llm()
+            if groq_llm is not None:
+                logger.warning("Anthropic returned HTTP 400; falling back to GROQ for %s", phase_name)
+                return groq_llm.invoke(messages)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -30,176 +101,186 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class AgentState(dict):
-    """
-    LangGraph state container.
-
-    messages:           Full conversation history (LLM + tool results).
-    daily_trade_count:  Running count of trades placed this session.
-                        Enforced as a circuit breaker in the system prompt;
-                        hard enforcement is in the execution tool.
-    """
     messages: Annotated[list[BaseMessage], add_messages]
     daily_trade_count: int
 
 
 # ---------------------------------------------------------------------------
-# System prompt
+# The decline_trade tool — makes NOT trading an active, auditable choice
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = f"""\
-You are an information-synthesis trading agent connected to an Interactive
-Brokers paper account with ~$1M in simulated capital. Your purpose is to
-ACTIVELY TRADE to build a track record that demonstrates whether LLM-driven
-information synthesis creates real alpha.
+from langchain_core.tools import tool
 
-═══════════════════════════════════════════════════════════════
-CRITICAL CONTEXT: EVALUATION MODE
-═══════════════════════════════════════════════════════════════
 
-This is a paper trading account. The money is not real. You are being
-evaluated on the QUALITY OF YOUR REASONING and your ability to generate
-a meaningful track record — NOT on capital preservation.
+@tool
+def decline_trade(
+    symbol: str,
+    reason: str,
+    what_would_change_your_mind: str,
+    reentry_price: float | None = None,
+    reassess_in_hours: int = 24,
+) -> dict:
+    """
+    Explicitly decline to trade a symbol. You MUST call this for every
+    symbol you analyzed but chose NOT to trade. This is mandatory —
+    you cannot end your turn without either trading or declining each
+    symbol in your analysis.
 
-A portfolio that sits 100% in cash generates zero signal about your
-capabilities. The cost of NOT trading is as high as the cost of a bad
-trade during this evaluation period, because both produce zero useful data.
+    Args:
+        symbol: The ticker you're passing on.
+        reason: Specific, data-grounded reason (not "waiting for a better setup").
+        what_would_change_your_mind: What condition would make this tradeable.
+        reentry_price: Price level that would trigger reconsideration.
+        reassess_in_hours: When to look at this again (default 24).
 
-YOUR MANDATE: Find opportunities, size them appropriately, and TAKE THEM.
-You should aim to have 3-6 positions open at any given time, using 30-50%
-of the portfolio. If you complete an analysis cycle and find no trades
-worth taking, you must explicitly explain what SPECIFIC condition would
-need to change for you to act — vague caution is not acceptable.
+    Returns:
+        Confirmation that the decline was logged.
+    """
+    result = {
+        "status": "DECLINED",
+        "symbol": symbol.upper(),
+        "reason": reason,
+        "trigger_condition": what_would_change_your_mind,
+        "reentry_price": reentry_price,
+        "reassess_in_hours": reassess_in_hours,
+    }
 
-═══════════════════════════════════════════════════════════════
-YOUR EDGE (and where you don't have one)
-═══════════════════════════════════════════════════════════════
+    log_trade("trade_declined", result)
+    logger.info(
+        "Trade declined: %s — %s (reconsider at $%s or in %dh)",
+        symbol, reason[:80],
+        reentry_price or "N/A",
+        reassess_in_hours,
+    )
 
-YOUR STRENGTHS — lean into these:
-• Reading SEC filings and identifying what changed from last quarter
-• Cross-referencing earnings surprises against analyst recommendation
-  trends to spot lagging consensus
-• Synthesizing macro regime with company fundamentals to assess whether
-  a setup is regime-appropriate
-• Detecting discrepancies: management tone vs actual numbers, guidance
-  language vs earnings trajectory, price action vs fundamental reality
-• Processing multiple information sources simultaneously and forming a
-  COHERENT thesis faster than a human can
+    return result
 
-YOUR WEAKNESSES — compensate for these:
-• You cannot predict price movements from chart patterns better than
-  noise. Technical indicators are CONFIRMATION tools, not signal sources.
-• You have no market intuition or feel for order flow.
-• You tend toward excessive caution and analysis paralysis. Fight this.
-  A well-reasoned position with a defined stop-loss is ALWAYS better
-  than sitting in cash waiting for perfection.
 
-═══════════════════════════════════════════════════════════════
-ANALYSIS WORKFLOW
-═══════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Tool sets for each phase
+# ---------------------------------------------------------------------------
 
-For any trade decision, follow this sequence:
+# Phase 1: all information + execution tools
+ANALYST_TOOLS = ALL_TOOLS
 
-1. MACRO CONTEXT — call get_macro_environment
-   What regime are we in? This sets your overall aggression level.
-   Risk-on regime → be willing to take medium-conviction setups.
-   Risk-off → stick to high-conviction only and tighten stops.
+# Phase 2: execution only — the trader can check portfolio/technicals
+# for final confirmation but primarily must execute or decline
+TRADER_TOOLS = [
+    get_portfolio_snapshot,
+    get_technical_summary,
+    place_trade,
+    place_bracket_trade,
+    close_position,
+    decline_trade,
+]
 
-2. FUNDAMENTAL ANALYSIS — call get_sec_filings and get_earnings_analysis
-   What do the numbers say? Look for: earnings beat streaks,
-   revenue acceleration/deceleration, margin expansion, guidance raises,
-   recent 8-K material events.
+# Name→tool lookups for sync execution
+_ANALYST_TOOL_MAP: dict[str, Any] = {t.name: t for t in ANALYST_TOOLS}
+_TRADER_TOOL_MAP: dict[str, Any] = {t.name: t for t in TRADER_TOOLS}
 
-3. TRANSCRIPT ANALYSIS — call get_earnings_transcript when available
-   Read for management tone, guidance language, analyst concerns.
-   This is your highest-value synthesis task.
 
-4. CATALYST IDENTIFICATION — call get_earnings_calendar and get_news_sentiment
-   What upcoming events could reprice this stock?
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
 
-5. TECHNICAL CONFIRMATION — call get_technical_summary
-   Use technicals to TIME your entry, not to generate the thesis.
-   Identify support levels for stop placement and resistance for targets.
+ANALYST_PROMPT = f"""\
+You are the ANALYST phase of a two-phase trading system connected to an
+Interactive Brokers paper account with ~$1M simulated capital.
 
-6. PORTFOLIO CHECK — call get_portfolio_snapshot before trading.
+YOUR JOB: Research and produce SPECIFIC TRADE RECOMMENDATIONS. You do NOT
+execute trades — a separate Trader agent will act on your recommendations.
 
-7. TRADE — if you have a thesis supported by at least TWO of the
-   following: fundamental case, catalyst, macro alignment, technical
-   confirmation. You do NOT need all four to act.
+Your output will be handed directly to the Trader, so be specific:
+- Name the symbols you recommend trading
+- Specify BUY or SELL
+- Suggest position size (% of NLV and approximate share count)
+- Provide entry price, stop-loss price, and take-profit target
+- State your conviction level (high/medium/exploratory)
+- Give a concise thesis (3-5 sentences with specific data points)
 
-═══════════════════════════════════════════════════════════════
-CONVICTION LEVELS AND POSITION SIZING
-═══════════════════════════════════════════════════════════════
+WORKFLOW:
+1. Check macro environment for regime context
+2. Check portfolio for current positions
+3. For each symbol on the watchlist or earnings calendar:
+   - Pull earnings analysis and SEC filings
+   - Pull earnings transcript if available
+   - Pull technicals for entry/exit levels
+4. Produce a structured recommendation for EACH symbol analyzed
 
-HIGH CONVICTION (fundamentals + catalyst + technicals aligned):
-  → 3-4% of NLV (~$30-40k notional)
-  → Use bracket orders with 2:1+ risk/reward
+YOU MUST RECOMMEND AT LEAST ONE TRADE per analysis session. If you
+genuinely cannot find a single opportunity across 6+ major stocks in a
+favorable macro environment, your standards are too high. A paper trading
+evaluation with 100% cash allocation is a failure state.
 
-MEDIUM CONVICTION (two signals aligned, one ambiguous):
-  → 1.5-2.5% of NLV (~$15-25k notional)
-  → Use bracket orders with 1.5:1+ risk/reward
+Target portfolio: 3-6 positions, 30-50% deployed.
 
-EXPLORATORY (interesting thesis, want to build a position):
-  → 0.5-1% of NLV (~$5-10k notional)
-  → Use a simple stop-loss at technical support
-
-DO NOT default to "I'll wait for a better setup." If your analysis
-produces a medium-conviction thesis, TAKE the trade at medium size.
-The whole point of paper trading is to test whether your medium-
-conviction theses are actually profitable.
-
-═══════════════════════════════════════════════════════════════
-THESIS REQUIREMENTS
-═══════════════════════════════════════════════════════════════
-
-Every trade thesis must include:
-• The CASE: what the data shows (cite specific numbers)
-• The CATALYST: why this should reprice (even "reversion to trend" counts)
-• The ENTRY LOGIC: why now, with specific price levels
-• The EXIT PLAN: stop-loss price AND take-profit target
-• The INVALIDATION: what would make you close early
-
-Keep theses concise — 3-5 sentences, not essays. Thesis quality is
-measured by specificity, not length.
-
-═══════════════════════════════════════════════════════════════
-HARD RULES (still non-negotiable)
-═══════════════════════════════════════════════════════════════
-
-1. Always check portfolio state before trading.
-2. Always analyze a symbol with at least one fundamental tool AND
-   technicals before trading it.
-3. Never average down on a losing position.
-4. Respect risk limit rejections — adjust size, don't retry.
-5. IBKR uses integer share quantities.
-6. PREFER bracket orders (entry + take-profit + stop-loss).
-7. Do not hold more than 8 individual positions at once.
+Conviction sizing:
+- High: 3-4% NLV (~$30-40k)
+- Medium: 1.5-2.5% NLV (~$15-25k)
+- Exploratory: 0.5-1% NLV (~$5-10k)
 
 Hard limits: {RISK.max_position_pct:.0%} max single position,
-{RISK.max_total_exposure_pct:.0%} max total exposure,
-{RISK.max_daily_trades} max daily trades.
+{RISK.max_total_exposure_pct:.0%} max total exposure.
+"""
 
-═══════════════════════════════════════════════════════════════
-PORTFOLIO REVIEW PROTOCOL
-═══════════════════════════════════════════════════════════════
+TRADER_PROMPT = """\
+You are the TRADER phase of a two-phase trading system. The Analyst has
+completed research and provided trade recommendations below.
 
-When reviewing existing positions:
-1. Pull portfolio snapshot
-2. For each position: pull fresh earnings data AND technicals
-3. Has any NEW information emerged since entry?
-4. Has the stop-loss level been breached?
-5. Has the take-profit target been hit?
-6. Action: HOLD (thesis intact), CLOSE (thesis broken), or TRIM
+YOUR JOB: Execute the trades or explicitly decline each one.
 
-When reviewing with zero positions:
-1. This is a problem — you should be building a portfolio
-2. Analyze your watchlist and FIND opportunities
-3. If the macro environment is favorable, take medium-conviction setups
-4. Explain specifically what you're looking for if you still pass
+RULES:
+1. For EVERY symbol the Analyst recommended, you MUST either:
+   a) Call place_bracket_trade or place_trade to execute, OR
+   b) Call decline_trade with a specific, data-grounded reason
+
+2. You CANNOT end your turn without addressing every recommendation.
+   Ending your turn without calling tools is a system error.
+
+3. Before your first trade, call get_portfolio_snapshot to confirm
+   current state.
+
+4. You may call get_technical_summary for final price confirmation
+   before setting bracket levels.
+
+5. For bracket orders, use the Analyst's suggested stop and target
+   levels, adjusted for current price if it has moved.
+
+6. DO NOT re-analyze or second-guess the Analyst's fundamental thesis.
+   Your job is EXECUTION and RISK MANAGEMENT, not re-doing the research.
+   The only valid reasons to decline are:
+   - Price has moved significantly since analysis (>2% from suggested entry)
+   - Risk limits would be violated
+   - The position would create unwanted concentration
+
+7. After executing all trades/declines, provide a brief summary of
+   what was done.
+
+THE ANALYST'S RECOMMENDATIONS:
+"""
+
+REVIEW_PROMPT = f"""\
+You are a portfolio management agent connected to an Interactive Brokers
+paper account. Review all current positions and take action.
+
+For EACH open position, you MUST either:
+  a) HOLD — state why the thesis is intact (cite current data)
+  b) CLOSE — call close_position with a reason
+  c) TRIM — call place_trade to reduce the position
+
+You also MUST call decline_trade for any position you choose to HOLD,
+documenting your hold thesis and what would trigger an exit.
+
+If the portfolio has fewer than 3 positions AND gross exposure is below
+30%, flag this and recommend symbols to analyze at the next morning scan.
+
+Hard limits: {RISK.max_position_pct:.0%} max single position,
+{RISK.max_total_exposure_pct:.0%} max total exposure.
 """
 
 
 # ---------------------------------------------------------------------------
-# LLM and tools
+# LLM instances
 # ---------------------------------------------------------------------------
 
 llm = ChatAnthropic(
@@ -207,107 +288,100 @@ llm = ChatAnthropic(
     temperature=LLM.temperature,
     max_tokens=LLM.max_tokens,
 )
-llm_with_tools = llm.bind_tools(ALL_TOOLS)
 
-# Build a name→tool lookup for the sync executor
-_TOOL_MAP: dict[str, Any] = {t.name: t for t in ALL_TOOLS}
+analyst_llm = llm.bind_tools(ANALYST_TOOLS)
+trader_llm = llm.bind_tools(TRADER_TOOLS)
 
 
 # ---------------------------------------------------------------------------
-# Synchronous tool executor (replaces LangGraph's ToolNode)
-#
-# ib_insync is single-threaded: its socket and event loop are bound to the
-# thread that created the connection. LangGraph's default ToolNode dispatches
-# tool calls into a ThreadPoolExecutor, which breaks ib_insync silently
-# (operations return empty/None because the event loop isn't pumping).
-#
-# This executor runs every tool call sequentially on the CALLING thread,
-# which is the same thread that owns the IB connection.
+# Sync tool executors
 # ---------------------------------------------------------------------------
 
-def sync_tool_node(state: AgentState) -> dict:
-    """
-    Execute tool calls from the last AI message synchronously.
-    Returns ToolMessage results for each call.
-    """
-    last_message = state["messages"][-1]
-    tool_calls = getattr(last_message, "tool_calls", [])
+def _make_sync_tool_node(tool_map: dict[str, Any]):
+    """Factory for synchronous tool executor nodes."""
 
-    tool_messages = []
-    for tc in tool_calls:
-        tool_name = tc["name"]
-        tool_args = tc.get("args", {})
-        tool_id = tc.get("id", tool_name)
+    def sync_tool_node(state: AgentState) -> dict:
+        last_message = state["messages"][-1]
+        tool_calls = getattr(last_message, "tool_calls", [])
 
-        tool_fn = _TOOL_MAP.get(tool_name)
-        if tool_fn is None:
-            tool_messages.append(ToolMessage(
-                content=f"Error: unknown tool '{tool_name}'",
-                tool_call_id=tool_id,
-                name=tool_name,
-            ))
-            continue
+        tool_messages = []
+        for tc in tool_calls:
+            tool_name = tc["name"]
+            tool_args = tc.get("args", {})
+            tool_id = tc.get("id", tool_name)
 
-        try:
-            result = tool_fn.invoke(tool_args)
-            # Ensure result is a string for the message
-            if not isinstance(result, str):
-                result = json.dumps(result, default=str, indent=2)
-            tool_messages.append(ToolMessage(
-                content=result,
-                tool_call_id=tool_id,
-                name=tool_name,
-            ))
-        except Exception as exc:
-            logger.error("Tool '%s' raised: %s", tool_name, exc, exc_info=True)
-            tool_messages.append(ToolMessage(
-                content=f"Error executing {tool_name}: {exc}",
-                tool_call_id=tool_id,
-                name=tool_name,
-            ))
+            tool_fn = tool_map.get(tool_name)
+            if tool_fn is None:
+                tool_messages.append(ToolMessage(
+                    content=f"Error: unknown tool '{tool_name}'. Available: {list(tool_map.keys())}",
+                    tool_call_id=tool_id,
+                    name=tool_name,
+                ))
+                continue
 
-    return {"messages": tool_messages}
+            try:
+                result = tool_fn.invoke(tool_args)
+                if not isinstance(result, str):
+                    result = json.dumps(result, default=str, indent=2)
+                tool_messages.append(ToolMessage(
+                    content=result,
+                    tool_call_id=tool_id,
+                    name=tool_name,
+                ))
+            except Exception as exc:
+                logger.error("Tool '%s' raised: %s", tool_name, exc, exc_info=True)
+                tool_messages.append(ToolMessage(
+                    content=f"Error executing {tool_name}: {exc}",
+                    tool_call_id=tool_id,
+                    name=tool_name,
+                ))
+
+        return {"messages": tool_messages}
+
+    return sync_tool_node
+
+
+analyst_tool_node = _make_sync_tool_node(_ANALYST_TOOL_MAP)
+trader_tool_node = _make_sync_tool_node(_TRADER_TOOL_MAP)
 
 
 # ---------------------------------------------------------------------------
 # Graph nodes
 # ---------------------------------------------------------------------------
 
-def agent_node(state: AgentState) -> dict:
-    """
-    Core reasoning node. Prepends the system prompt if not already present,
-    then invokes the LLM with tool bindings.
-    """
-    messages = state.get("messages", [])
+def _make_agent_node(bound_llm, prompt: str, phase_name: str):
+    """Factory for agent reasoning nodes."""
 
-    # Inject system prompt once
-    if not any(isinstance(m, SystemMessage) for m in messages):
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+    def agent_node(state: AgentState) -> dict:
+        messages = state.get("messages", [])
 
-    t0 = time.monotonic()
-    response = llm_with_tools.invoke(messages)
-    elapsed = time.monotonic() - t0
+        if not any(isinstance(m, SystemMessage) for m in messages):
+            messages = [SystemMessage(content=prompt)] + messages
 
-    # Audit: log what the LLM decided
-    tool_calls = []
-    if hasattr(response, "tool_calls") and response.tool_calls:
-        tool_calls = [
-            {"name": tc["name"], "args_summary": _summarize_args(tc.get("args", {}))}
-            for tc in response.tool_calls
-        ]
+        t0 = time.monotonic()
+        response = _invoke_with_groq_fallback(bound_llm, messages, phase_name)
+        elapsed = time.monotonic() - t0
 
-    log_agent("llm_response", {
-        "elapsed_sec": round(elapsed, 2),
-        "tool_calls": tool_calls,
-        "content_length": len(response.content) if isinstance(response.content, str) else 0,
-        "stop_reason": getattr(response, "response_metadata", {}).get("stop_reason"),
-    })
+        tool_calls = []
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            tool_calls = [
+                {"name": tc["name"], "args_summary": _summarize_args(tc.get("args", {}))}
+                for tc in response.tool_calls
+            ]
 
-    return {"messages": [response]}
+        log_agent(f"{phase_name}_response", {
+            "elapsed_sec": round(elapsed, 2),
+            "tool_calls": tool_calls,
+            "content_length": len(response.content) if isinstance(response.content, str) else 0,
+            "stop_reason": getattr(response, "response_metadata", {}).get("stop_reason"),
+        })
+
+        return {"messages": [response]}
+
+    return agent_node
 
 
 def _summarize_args(args: dict) -> dict:
-    """Truncate large args for logging (don't dump full tool results into the log)."""
     return {
         k: v if isinstance(v, (int, float, bool)) or (isinstance(v, str) and len(v) < 200)
         else f"<{type(v).__name__}:{len(str(v))}chars>"
@@ -316,10 +390,6 @@ def _summarize_args(args: dict) -> dict:
 
 
 def route_after_agent(state: AgentState) -> str:
-    """
-    Conditional edge: if the LLM made tool calls, route to the tool node.
-    Otherwise, the agent is done — route to END.
-    """
     last = state["messages"][-1]
     if hasattr(last, "tool_calls") and last.tool_calls:
         return "tools"
@@ -327,80 +397,193 @@ def route_after_agent(state: AgentState) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Graph assembly
+# Build separate graphs for each phase
 # ---------------------------------------------------------------------------
 
-def build_graph() -> StateGraph:
-    """
-    Construct and compile the agent graph.
-
-    The graph is:
-        agent ──[has tool calls?]──> tools ──> agent (loop)
-               └──[no tool calls]──> END
-    """
+def _build_phase_graph(agent_node_fn, tool_node_fn):
+    """Build a standard agent→tools loop graph."""
     workflow = StateGraph(AgentState)
-
-    workflow.add_node("agent", agent_node)
-    workflow.add_node("tools", sync_tool_node)
-
+    workflow.add_node("agent", agent_node_fn)
+    workflow.add_node("tools", tool_node_fn)
     workflow.set_entry_point("agent")
     workflow.add_conditional_edges(
-        "agent",
-        route_after_agent,
-        {"tools": "tools", END: END},
+        "agent", route_after_agent, {"tools": "tools", END: END}
     )
     workflow.add_edge("tools", "agent")
-
     return workflow.compile()
 
 
-# Module-level compiled graph (import and use directly)
-graph = build_graph()
+analyst_graph = _build_phase_graph(
+    _make_agent_node(analyst_llm, ANALYST_PROMPT, "analyst"),
+    analyst_tool_node,
+)
+
+trader_graph = _build_phase_graph(
+    _make_agent_node(trader_llm, TRADER_PROMPT, "trader"),
+    trader_tool_node,
+)
+
+review_graph = _build_phase_graph(
+    _make_agent_node(trader_llm, REVIEW_PROMPT, "reviewer"),
+    trader_tool_node,
+)
 
 
 # ---------------------------------------------------------------------------
-# Convenience runner
+# Two-phase runner
 # ---------------------------------------------------------------------------
+
+def _extract_analysis(messages: list[BaseMessage]) -> str:
+    """Extract the analyst's final text output from the message history."""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and isinstance(msg.content, str) and msg.content.strip():
+            return msg.content
+    return "No analysis produced — the analyst phase did not generate recommendations."
+
 
 def run_agent(directive: str) -> list[BaseMessage]:
     """
-    Execute one full agent loop with a natural-language directive.
+    Execute the two-phase analyst→trader pipeline.
 
-    Examples:
-        run_agent("Analyze AAPL and NVDA. If either shows a clear setup, take a position.")
-        run_agent("Review all open positions and close anything that's deteriorated.")
-        run_agent("Scan NVDA, AMD, AVGO — rank by setup quality and take your top pick.")
-        run_agent("Close our AAPL position — thesis has broken down.")
+    Phase 1: Analyst researches and produces trade recommendations.
+    Phase 2: Trader executes each recommendation or explicitly declines.
 
-    Returns:
-        The full message history (SystemMessage, HumanMessage, AIMessage,
-        ToolMessage, ...) for inspection or display.
+    Returns the combined message history from both phases.
     """
-    logger.info("Agent directive: %s", directive[:200])
+    logger.info("═══ PHASE 1: ANALYST ═══")
+    logger.info("Directive: %s", directive[:200])
     t0 = time.monotonic()
 
-    result = graph.invoke({
+    # --- Phase 1: Analyst ---
+    analyst_result = analyst_graph.invoke({
         "messages": [HumanMessage(content=directive)],
         "daily_trade_count": 0,
     })
 
-    elapsed = time.monotonic() - t0
-    message_count = len(result["messages"])
-    tool_call_count = sum(
-        len(m.tool_calls) for m in result["messages"]
+    analyst_messages = analyst_result["messages"]
+    analysis_text = _extract_analysis(analyst_messages)
+
+    analyst_elapsed = time.monotonic() - t0
+    analyst_tool_count = sum(
+        len(m.tool_calls) for m in analyst_messages
         if hasattr(m, "tool_calls") and m.tool_calls
     )
 
+    log_agent("analyst_complete", {
+        "directive": directive[:500],
+        "elapsed_sec": round(analyst_elapsed, 2),
+        "message_count": len(analyst_messages),
+        "tool_call_count": analyst_tool_count,
+        "analysis_length": len(analysis_text),
+    })
+
     logger.info(
-        "Agent completed in %.1fs — %d messages, %d tool calls.",
-        elapsed, message_count, tool_call_count,
+        "Analyst complete: %d messages, %d tool calls, %.0fs. Analysis: %d chars.",
+        len(analyst_messages), analyst_tool_count, analyst_elapsed, len(analysis_text),
+    )
+
+    # --- Phase 2: Trader ---
+    logger.info("═══ PHASE 2: TRADER ═══")
+    logger.info("Feeding analysis to trader (%d chars)...", len(analysis_text))
+
+    trader_directive = (
+        f"The Analyst has completed research. Here are the recommendations:\n\n"
+        f"---\n{analysis_text}\n---\n\n"
+        f"Execute each recommendation or decline with justification. "
+        f"You MUST call a tool for every symbol mentioned above."
+    )
+
+    t1 = time.monotonic()
+
+    trader_result = trader_graph.invoke({
+        "messages": [HumanMessage(content=trader_directive)],
+        "daily_trade_count": 0,
+    })
+
+    trader_messages = trader_result["messages"]
+    trader_elapsed = time.monotonic() - t1
+    trader_tool_count = sum(
+        len(m.tool_calls) for m in trader_messages
+        if hasattr(m, "tool_calls") and m.tool_calls
+    )
+
+    # Count actual trades vs declines
+    trade_count = 0
+    decline_count = 0
+    for msg in trader_messages:
+        if isinstance(msg, ToolMessage):
+            try:
+                data = json.loads(msg.content) if isinstance(msg.content, str) else {}
+                status = data.get("status", "")
+                if status == "SUBMITTED":
+                    trade_count += 1
+                elif status == "DECLINED":
+                    decline_count += 1
+                elif status == "REJECTED":
+                    decline_count += 1
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    log_agent("trader_complete", {
+        "elapsed_sec": round(trader_elapsed, 2),
+        "message_count": len(trader_messages),
+        "tool_call_count": trader_tool_count,
+        "trades_executed": trade_count,
+        "trades_declined": decline_count,
+    })
+
+    total_elapsed = time.monotonic() - t0
+    logger.info(
+        "Trader complete: %d trades executed, %d declined, %.0fs.",
+        trade_count, decline_count, trader_elapsed,
+    )
+    logger.info(
+        "═══ PIPELINE COMPLETE: %.0fs total, %d trades ═══",
+        total_elapsed, trade_count,
     )
 
     log_agent("run_complete", {
         "directive": directive[:500],
-        "elapsed_sec": round(elapsed, 2),
-        "message_count": message_count,
-        "tool_call_count": tool_call_count,
+        "elapsed_sec": round(total_elapsed, 2),
+        "analyst_messages": len(analyst_messages),
+        "trader_messages": len(trader_messages),
+        "analyst_tool_calls": analyst_tool_count,
+        "trader_tool_calls": trader_tool_count,
+        "trades_executed": trade_count,
+        "trades_declined": decline_count,
     })
 
-    return result["messages"]
+    return analyst_messages + trader_messages
+
+
+def run_review(directive: str) -> list[BaseMessage]:
+    """
+    Execute a portfolio review — uses the review graph which has
+    execution tools and the decline_trade forcing function.
+    """
+    logger.info("═══ PORTFOLIO REVIEW ═══")
+    logger.info("Directive: %s", directive[:200])
+    t0 = time.monotonic()
+
+    result = review_graph.invoke({
+        "messages": [HumanMessage(content=directive)],
+        "daily_trade_count": 0,
+    })
+
+    messages = result["messages"]
+    elapsed = time.monotonic() - t0
+    tool_count = sum(
+        len(m.tool_calls) for m in messages
+        if hasattr(m, "tool_calls") and m.tool_calls
+    )
+
+    log_agent("review_complete", {
+        "directive": directive[:500],
+        "elapsed_sec": round(elapsed, 2),
+        "message_count": len(messages),
+        "tool_call_count": tool_count,
+    })
+
+    logger.info("Review complete: %d messages, %d tool calls, %.0fs.", len(messages), tool_count, elapsed)
+
+    return messages
